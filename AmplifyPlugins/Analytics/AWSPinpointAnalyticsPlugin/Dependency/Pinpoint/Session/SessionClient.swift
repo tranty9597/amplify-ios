@@ -8,30 +8,89 @@
 import Amplify
 import Foundation
 
-class SessionClient: InternalPinpointClient {
-    private let archiver: AmplifyArchiverBehaviour
-    private let activityTracker: ActivityTracker
-    private var session: PinpointSession
-    unowned var context: PinpointContext
+protocol SessionClientBehaviour {
+    var currentSession: PinpointSession { get }
 
-    init(context: PinpointContext,
-         archiver: AmplifyArchiverBehaviour = AmplifyArchiver()) {
-        activityTracker = ActivityTracker(timeout: context.configuration.sessionTimeout)
+    func startPinpointSession()
+    func validateOrRetrieveSession(_ session: PinpointSession?) -> PinpointSession
+}
+
+struct SessionClientConfiguration {
+    let appId: String
+    let uniqueDeviceId: String
+    let sessionTimeout: TimeInterval
+}
+
+class SessionClient: SessionClientBehaviour {
+    private var session: PinpointSession
+    
+    private let activityTracker: ActivityTrackerBehaviour
+    private let analyticsClient: AnalyticsClientBehaviour
+    private let archiver: AmplifyArchiverBehaviour
+    private let configuration: SessionClientConfiguration
+    private let endpointClient: EndpointClient
+    private let sessionClientQueue = DispatchQueue(label: Constants.queue,
+                                                   attributes: .concurrent)
+    private let userDefaults: UserDefaultsBehaviour
+
+    convenience init(context: PinpointContext,
+                     archiver: AmplifyArchiverBehaviour = AmplifyArchiver(),
+                     activityTracker: ActivityTrackerBehaviour? = nil) {
+        self.init(activityTracker: activityTracker ?? ActivityTracker.create(from: context),
+                  analyticsClient: context.analyticsClient,
+                  archiver: archiver,
+                  configuration: SessionClientConfiguration(appId: context.configuration.appId,
+                                                            uniqueDeviceId: context.uniqueId,
+                                                            sessionTimeout: context.configuration.sessionTimeout),
+                  endpointClient: context.targetingClient,
+                  userDefaults: context.userDefaults)
+    }
+
+    init(activityTracker: ActivityTrackerBehaviour,
+         analyticsClient: AnalyticsClientBehaviour,
+         archiver: AmplifyArchiverBehaviour = AmplifyArchiver(),
+         configuration: SessionClientConfiguration,
+         endpointClient: EndpointClient,
+         userDefaults: UserDefaultsBehaviour) {
+        self.activityTracker = activityTracker
+        self.analyticsClient = analyticsClient
         self.archiver = archiver
-        self.context = context
-        session = PinpointSession(appId: context.configuration.appId,
-                                  uniqueId: context.uniqueId)
-        startSession()
+        self.configuration = configuration
+        self.endpointClient = endpointClient
+        self.userDefaults = userDefaults
+        session = Self.retrieveStoredSession(from: userDefaults, using: archiver) ?? PinpointSession.invalid
     }
 
     var currentSession: PinpointSession {
-        if !session.sessionId.isEmpty {
+        if session == PinpointSession.invalid {
+            startNewSession()
+        }
+        return session
+    }
+
+    func startPinpointSession() {
+        activityTracker.beginActivityTracking { [weak self] newState in
+            guard let self = self else { return }
+            self.log.verbose("New state received: \(newState)")
+            self.sessionClientQueue.sync(flags: .barrier) {
+                self.respond(to: newState)
+            }
+        }
+
+        sessionClientQueue.sync(flags: .barrier) {
+            if session != PinpointSession.invalid {
+                endSession()
+            }
+            startNewSession()
+        }
+    }
+
+    func validateOrRetrieveSession(_ session: PinpointSession?) -> PinpointSession {
+        if let session = session, !session.sessionId.isEmpty {
             return session
         }
         
-        if let sessionData = context.userDefaults.data(forKey: Constants.sessionKey),
-           let storedSession = try? archiver.decode(PinpointSession.self, from: sessionData),
-           !storedSession.sessionId.isEmpty {
+        if let storedSession = Self.retrieveStoredSession(from: userDefaults, using: archiver) {
             return storedSession
         }
         
@@ -40,26 +99,36 @@ class SessionClient: InternalPinpointClient {
                                stopTime: Date())
     }
 
-    private func startSession() {
+    private static func retrieveStoredSession(from userDefaults: UserDefaultsBehaviour,
+                                              using archiver: AmplifyArchiverBehaviour) -> PinpointSession? {
+        guard let sessionData = userDefaults.data(forKey: Constants.sessionKey),
+              let storedSession = try? archiver.decode(PinpointSession.self, from: sessionData),
+              !storedSession.sessionId.isEmpty else {
+            return nil
+        }
+        
+        return storedSession
+    }
+
+    private func startNewSession() {
+        session = PinpointSession(appId: configuration.appId,
+                                  uniqueId: configuration.uniqueDeviceId)
         saveSession()
         log.info("Session Started.")
-        activityTracker.delegate = self
-        activityTracker.beginActivityTracking()
-
-        let startEvent = context.analyticsClient.createEvent(withEventType: Constants.Events.start)
+        let startEvent = analyticsClient.createEvent(withEventType: Constants.Events.start)
         
         // Update Endpoint and record Session Start event
         Task {
-            try? await context.targetingClient.updateEndpointProfile()
+            try? await endpointClient.updateEndpointProfile()
             log.verbose("Firing Session Event: Start")
-            try? await context.analyticsClient.record(startEvent)
+            try? await analyticsClient.record(startEvent)
         }
     }
 
     private func saveSession() {
         do {
             let sessionData = try archiver.encode(session)
-            context.userDefaults.save(sessionData, forKey: Constants.sessionKey)
+            userDefaults.save(sessionData, forKey: Constants.sessionKey)
         } catch {
             log.error("Error archiving sessionData: \(error.localizedDescription)")
         }
@@ -70,10 +139,10 @@ class SessionClient: InternalPinpointClient {
         saveSession()
         log.info("Session Paused.")
 
-        let pauseEvent = context.analyticsClient.createEvent(withEventType: Constants.Events.pause)
+        let pauseEvent = analyticsClient.createEvent(withEventType: Constants.Events.pause)
         Task {
             log.verbose("Firing Session Event: Pause")
-            try? await context.analyticsClient.record(pauseEvent)
+            try? await analyticsClient.record(pauseEvent)
         }
     }
     
@@ -86,9 +155,7 @@ class SessionClient: InternalPinpointClient {
         guard !isSessionExpired(session) else {
             log.verbose("Session has expired. Starting a fresh one...")
             endSession()
-            session = PinpointSession(appId: context.configuration.appId,
-                                      uniqueId: context.uniqueId)
-            startSession()
+            startNewSession()
             return
         }
         
@@ -96,10 +163,10 @@ class SessionClient: InternalPinpointClient {
         saveSession()
         log.info("Session Resumed.")
 
-        let resumeEvent = context.analyticsClient.createEvent(withEventType: Constants.Events.resume)
+        let resumeEvent = analyticsClient.createEvent(withEventType: Constants.Events.resume)
         Task {
             log.verbose("Firing Session Event: Resume")
-            try? await context.analyticsClient.record(resumeEvent)
+            try? await analyticsClient.record(resumeEvent)
         }
     }
     
@@ -109,10 +176,10 @@ class SessionClient: InternalPinpointClient {
 
         // TODO: Remove Global Event Source Attributes
 
-        let stopEvent = context.analyticsClient.createEvent(withEventType: Constants.Events.stop)
+        let stopEvent = analyticsClient.createEvent(withEventType: Constants.Events.stop)
         Task {
             log.verbose("Firing Session Event: Stop")
-            try? await context.analyticsClient.record(stopEvent)
+            try? await analyticsClient.record(stopEvent)
         }
     }
     
@@ -122,28 +189,26 @@ class SessionClient: InternalPinpointClient {
         }
         
         let now = Date().timeIntervalSince1970
-        return now - stopTime < context.configuration.sessionTimeout
-    }
-}
-
-// MARK: - ActivityTrackerDelegate
-extension SessionClient: ActivityTrackerDelegate {
-    func appDidMoveToBackground() {
-        pauseSession()
+        return now - stopTime > configuration.sessionTimeout
     }
     
-    func appDidMoveToForeground() {
-        resumeSession()
-    }
-    
-    func appWillTerminate() {
-        endSession()
-    }
-    
-    func backgroundTrackingDidTimeout() {
-        endSession()
-        Task {
-            try? await context.analyticsClient.submitEvents()
+    private func respond(to newState: ApplicationState) {
+        switch newState {
+        case .runningInBackground(let isStale):
+            if isStale {
+                endSession()
+                Task {
+                    try? await analyticsClient.submitEvents()
+                }
+            } else {
+                pauseSession()
+            }
+        case .runningInForeground:
+            resumeSession()
+        case .terminated:
+            endSession()
+        case .initializing:
+            break
         }
     }
 }
@@ -154,6 +219,7 @@ extension SessionClient: DefaultLogger {}
 extension SessionClient {
     struct Constants {
         static let sessionKey = "com.amazonaws.AWSPinpointSessionKey"
+        static let queue = "com.amazonaws.Amplify.SessionClientQueue"
         
         struct Events {
             static let start = "_session.start"
@@ -162,4 +228,8 @@ extension SessionClient {
             static let resume = "_session.resume"
         }
     }
+}
+
+private extension PinpointSession {
+    static var invalid = PinpointSession(sessionId: "InvalidId", startTime: Date(), stopTime: nil)
 }
