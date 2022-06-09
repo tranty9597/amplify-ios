@@ -27,8 +27,10 @@ extension Temporal {
 
     /// Lock to ensure exclusive access
     ///
-    /// `os_unfair_lock` / `os_unfair_lock_s` are Swift value types and, as such,
-    /// should not be used directly
+    /// `os_unfair_lock` / `os_unfair_lock_s` is a Swift value type and, as such,
+    /// should not be used directly as an `inout` argument. Swift assumes that `struct`
+    /// type kinds **can** be copied on an `inout`. Allocating this to the heap through
+    /// an `UnsafeMutablePointer` prevents copies from being made.
     private static let lock: UnsafeMutablePointer<os_unfair_lock> = {
         let pointer = UnsafeMutablePointer<os_unfair_lock>.allocate(capacity: 1)
         pointer.initialize(to: os_unfair_lock())
