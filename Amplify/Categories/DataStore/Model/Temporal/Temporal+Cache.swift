@@ -134,7 +134,9 @@ extension Temporal {
         in timeZone: TimeZone = .utc
     ) throws -> Foundation.Date {
         for format in formats {
-            let formatter = formatter(for: format, in: timeZone)
+            let formatter = DateFormatter() //formatter(for: format, in: timeZone)
+            formatter.dateFormat = format
+            formatter.timeZone = timeZone
             if let date = formatter.date(from: string) {
                 return date
             }
@@ -156,7 +158,9 @@ extension Temporal {
         with format: String,
         in timeZone: TimeZone = .utc
     ) -> String {
-        let formatter = formatter(for: format, in: timeZone)
+        let formatter = DateFormatter() //formatter(for: format, in: timeZone)
+        formatter.dateFormat = format
+        formatter.timeZone = timeZone
         let string = formatter.string(from: date)
         return string
     }
